@@ -318,4 +318,54 @@ final class AMQPChannelTest: XCTestCase {
         try await channel.queueDelete(name: "test_consume")
         try await channel.close()
     }
+    
+    func testConsumerCancelAndCloseConcurrencyTest() async throws {
+        for run in 0...10 {
+            let queueName = "temp_queue_\(run)"
+            let channel = try await connection.openChannel()
+            let isConsuming = AsyncSignal()
+            
+            try await channel.queueDeclare(name: queueName, durable: false, exclusive: true)
+            
+            let consumer = try await channel.basicConsume(queue: queueName, noAck: true)
+            try await channel.basicPublish(from: ByteBuffer(string: "foo"), exchange: "", routingKey: queueName)
+            
+            let consumeTask = Task {
+                for try await _ in consumer {
+                    isConsuming.signal()
+                }
+            }
+            
+            await isConsuming.wait()
+            
+            consumeTask.cancel()
+            try await consumeTask.value
+            try await channel.close()
+        }
+    }
+}
+
+// very basic async signal to avoid dependencies on other packages, works only once
+final class AsyncSignal: @unchecked Sendable {
+    private var continuation: CheckedContinuation<Void, Never>!
+    private var handle: Task<Void, Never>!
+    
+    init() {
+        let semaphore = DispatchSemaphore(value: 0)
+        self.handle = Task {
+            await withCheckedContinuation {
+                continuation = $0
+                semaphore.signal()
+            }
+        }
+        semaphore.wait()
+    }
+    
+    func wait() async {
+        await handle.value
+    }
+    
+    func signal() {
+        continuation.resume()
+    }
 }
