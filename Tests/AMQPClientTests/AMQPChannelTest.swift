@@ -342,6 +342,12 @@ final class AMQPChannelTest: XCTestCase {
             try await consumeTask.value
             try await channel.close()
         }
+    func testOpenChannelsConcurrencly() async throws {
+        async let first = connection.openChannel()
+        async let second = connection.openChannel()
+        
+        try await first.close()
+        try await second.close()
     }
     
     func testConcurrentOperationsOnChannel() async throws {
@@ -353,37 +359,13 @@ final class AMQPChannelTest: XCTestCase {
             
             //just a few parallel operations
             async let o1 = channel.basicConsume(queue: queueName)
-            async let o2 = channel.flow(active: true)
-            async let o3 = channel.basicPublish(from: ByteBuffer(string: "baz"), exchange: "", routingKey: queueName)
+            async let o2 = channel.basicPublish(from: ByteBuffer(string: "baz"), exchange: "", routingKey: queueName)
+            async let o3 = channel.basicConsume(queue: queueName)
+            async let o4 = channel.basicPublish(from: ByteBuffer(string: "baz"), exchange: "", routingKey: queueName)
             let tag = try await o1
             async let o4: () = channel.basicCancel(consumerTag: tag.name)
             
-            _ = try await (o2, o3, o4)
+            _ = try await (o2, o3, o4, o5)
         }
-    }
-}
-
-// very basic async signal to avoid dependencies on other packages, works only once
-final class AsyncSignal: @unchecked Sendable {
-    private var continuation: CheckedContinuation<Void, Never>!
-    private var handle: Task<Void, Never>!
-    
-    init() {
-        let semaphore = DispatchSemaphore(value: 0)
-        self.handle = Task {
-            await withCheckedContinuation {
-                continuation = $0
-                semaphore.signal()
-            }
-        }
-        semaphore.wait()
-    }
-    
-    func wait() async {
-        await handle.value
-    }
-    
-    func signal() {
-        continuation.resume()
     }
 }

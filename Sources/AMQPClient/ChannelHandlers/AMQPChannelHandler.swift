@@ -23,14 +23,10 @@ internal final class AMQPChannelHandler<Parent: AMPQChannelHandlerParent> {
         case closed
     }
 
-    private var _state = ConnectionState.open
-    private var state: ConnectionState {
-        get { return _lock.withLock { self._state } }
-        set(newValue) { _lock.withLockVoid { self._state = newValue } }
-    }
+    private let state = NIOLockedValueBox(ConnectionState.open)
 
     public var isOpen: Bool {
-        return self.state == .open
+        return self.state.withLockedValue{ $0 == .open }
     }
     
     private let parent: Parent
@@ -160,55 +156,48 @@ internal final class AMQPChannelHandler<Parent: AMPQChannelHandlerParent> {
     }
 
     func send(payload: Frame.Payload) -> EventLoopFuture<AMQPResponse> {
-        let promise = self.eventLoop.makePromise(of: AMQPResponse.self)
-
-        let sendResult: EventLoopFuture<Void> = self.send(payload: payload)
-        
-        sendResult.whenFailure { promise.fail($0) }
-        sendResult.whenSuccess { self.responseQueue.append(promise) }
-
-        return sendResult.flatMap {  
-            promise.futureResult
-        }
-    }
-
-    func send(payloads: [Frame.Payload]) -> EventLoopFuture<AMQPResponse> {
-        let promise = self.eventLoop.makePromise(of: AMQPResponse.self)
-
-        let sendResult: EventLoopFuture<Void> = self.send(payloads: payloads)
-
-        sendResult.whenFailure { promise.fail($0) }
-        sendResult.whenSuccess { self.responseQueue.append(promise) }
-
-        return sendResult.flatMap {
-            promise.futureResult
-        }
-    }
-
-    func send(payloads: [Frame.Payload]) -> EventLoopFuture<Void> {
         guard self.isOpen else { return self.eventLoop.makeFailedFuture(AMQPConnectionError.channelClosed()) }
 
-        let frames = payloads.map { Frame(channelID: self.channelID, payload: $0) }
+        let promise = self.eventLoop.makePromise(of: AMQPResponse.self)
         
-        let promise = self.eventLoop.makePromise(of: Void.self)
+        let frame = Frame(channelID: self.channelID, payload: payload)
+
+        let writePromise = self.eventLoop.makePromise(of: Void.self)
+        writePromise.futureResult.whenFailure { promise.fail($0) }
+        writePromise.futureResult.whenSuccess { self.responseQueue.append(promise) }
 
         return self.eventLoop.flatSubmit {
-            self.parent.write(frames: frames, promise: promise)
-            return promise.futureResult
-        }
+            self.parent.write(frame: frame, promise: writePromise)
+            return writePromise.futureResult.flatMap {
+                    promise.futureResult
+                }
+            }
     }
-
+    
     func send(payload: Frame.Payload) -> EventLoopFuture<Void> {
         guard self.isOpen else { return self.eventLoop.makeFailedFuture(AMQPConnectionError.channelClosed()) }
 
         let frame = Frame(channelID: self.channelID, payload: payload)
-        
-        let promise = self.eventLoop.makePromise(of: Void.self)
+
+        let writePromise = self.eventLoop.makePromise(of: Void.self)
 
         return self.eventLoop.flatSubmit {
-            self.parent.write(frame: frame, promise: promise)
-            return promise.futureResult
+            self.parent.write(frame: frame, promise: writePromise)
+            return writePromise.futureResult
         }
+    }
+    
+    func send(payloads: [Frame.Payload]) -> EventLoopFuture<Void> {
+        guard self.isOpen else { return self.eventLoop.makeFailedFuture(AMQPConnectionError.channelClosed()) }
+
+        let frames = payloads.map { Frame(channelID: self.channelID, payload: $0) }
+
+        let writePromise = self.eventLoop.makePromise(of: Void.self)
+
+        return self.eventLoop.flatSubmit {
+            self.parent.write(frames: frames, promise: writePromise)
+            return writePromise.futureResult
+         }
     }
 
     func receive(payload: Frame.Payload) {
@@ -399,9 +388,16 @@ internal final class AMQPChannelHandler<Parent: AMPQChannelHandlerParent> {
     }
 
     func close(error: Error? = nil) {
-        guard self.isOpen else { return }
+        let shouldClose = self.state.withLockedValue { state in
+            if state == .open {
+                state = .shuttingDown
+                return true
+            }
 
-        self.state = .shuttingDown
+            return false
+        }
+        
+        guard shouldClose else { return }
 
         let queue = self.responseQueue
         self.responseQueue.removeAll()
@@ -418,7 +414,7 @@ internal final class AMQPChannelHandler<Parent: AMPQChannelHandlerParent> {
 
         error == nil ? closePromise.succeed(()) : closePromise.fail(error!)
 
-        self.state = .closed
+        self.state.withLockedValue{ $0 = .closed }
     }
 
     deinit {
