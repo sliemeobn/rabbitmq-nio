@@ -343,6 +343,24 @@ final class AMQPChannelTest: XCTestCase {
             try await channel.close()
         }
     }
+    
+    func testConcurrentOperationsOnChannel() async throws {
+        for run in 0...10 {
+            let queueName = "temp_queue_\(run)"
+            
+            let channel = try await connection.openChannel()
+            try await channel.queueDeclare(name: queueName, durable: false, exclusive: true)
+            
+            //just a few parallel operations
+            async let o1 = channel.basicConsume(queue: queueName)
+            async let o2 = channel.flow(active: true)
+            async let o3 = channel.basicPublish(from: ByteBuffer(string: "baz"), exchange: "", routingKey: queueName)
+            let tag = try await o1
+            async let o4: () = channel.basicCancel(consumerTag: tag.name)
+            
+            _ = try await (o2, o3, o4)
+        }
+    }
 }
 
 // very basic async signal to avoid dependencies on other packages, works only once
